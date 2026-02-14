@@ -1,0 +1,88 @@
+services:
+  worker_download:
+    image: worker-download:latest
+    volumes:
+      - ./worker_download:/app
+      - ./shared_utils.py:/app/shared_utils.py
+      - /tmp:/tmp
+    command: python worker_downlaod.py
+    restart: unless-stopped
+
+  worker_split:
+    image: worker-base:latest
+    volumes:
+      - ./worker_split:/app
+      - ./shared_utils.py:/app/shared_utils.py
+      - /tmp:/tmp
+    command: python worker_split.py
+    restart: unless-stopped
+
+  worker_transcribe:
+    image: worker-transcribe:latest
+    volumes:
+      - ./worker_transcribe:/app
+      - ./shared_utils.py:/app/shared_utils.py
+      - /tmp:/tmp
+    command: python worker_transcribe.py
+    restart: unless-stopped
+
+  worker_audio:
+    image: worker-audio:latest
+    volumes:
+      - ./worker_audio:/app
+      - ./shared_utils.py:/app/shared_utils.py
+      - /tmp:/tmp
+    command: python worker_audio_features.py
+    restart: unless-stopped
+
+  worker_metadata:
+    image: worker-base:latest
+    volumes:
+      - ./worker_metadata:/app
+      - ./shared_utils.py:/app/shared_utils.py
+    command: python worker_metadata_public.py
+    restart: unless-stopped
+
+  worker_scoring:
+    image: worker-base:latest
+    volumes:
+      - ./worker_scoring:/app
+      - ./shared_utils.py:/app/shared_utils.py
+    command: python worker_scoring.py
+    restart: unless-stopped
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    volumes:
+      - ./ingestion:/app
+      - ./shared_utils.py:/app/shared_utils.py
+    ports:
+      - "8501:8501"
+    command: streamlit run main.py --server.port=8501 --server.address=0.0.0.0
+    restart: unless-stopped
+
+#  rabbitmq:
+#    image: rabbitmq:3.12-management
+#    ports:
+#      - "5672:5672"
+#      - "15672:15672"
+#    environment:
+#      RABBITMQ_DEFAULT_USER: funere
+#      RABBITMQ_DEFAULT_PASS: b4t4t49152
+#    volumes:
+#      - rabbitmq_data:/var/lib/rabbitmq
+#    restart: unless-stopped
+#
+#  redis:
+#    image: redis:7-alpine
+#    ports:
+#      - "6379:6379"
+#    volumes:
+#      - redis_data:/data
+#    restart: unless-stopped
+#
+#volumes:
+#  rabbitmq_data:
+#  redis_data:

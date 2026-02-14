@@ -1,0 +1,18 @@
+FROM worker-base:latest
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -U pip setuptools wheel \
+&& pip install --no-cache-dir openai-whisper \ 
+&& pip install --no-cache-dir -r requirements.txt
+
+
+CMD ["python", "worker.py"]
+

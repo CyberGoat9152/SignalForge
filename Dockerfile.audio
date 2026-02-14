@@ -1,0 +1,18 @@
+FROM worker-base:latest
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsndfile1 \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -U pip setuptools wheel 
+RUN pip install --no-cache-dir librosa
+RUN pip install --no-cache-dir -r requirements.txt 
+
+CMD ["python", "worker.py"]
