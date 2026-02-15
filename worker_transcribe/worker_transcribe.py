@@ -2,11 +2,12 @@ import pika
 import json
 import yaml
 import redis
-import subprocess
 import time
 import os
 from datetime import datetime, timezone
 import sys
+from faster_whisper import WhisperModel
+
 sys.path.append('..')
 from shared_utils import get_mongo_client, get_minio_client, log_execution, download_from_minio, upload_to_minio
 
@@ -27,6 +28,11 @@ mongo_client = get_mongo_client(config)
 mongo_db = mongo_client[config["MONGO_DB"]]
 s3_client = get_minio_client(config)
 bucket = config["MINIO_BUCKET"]
+
+# Initialize the model once (outside callback for efficiency)
+# Options: "tiny", "base", "small", "medium", "large-v2", "large-v3"
+model = WhisperModel("medium", device="cpu", compute_type="int8")
+# For GPU: device="cuda", compute_type="float16"
 
 def callback(ch, method, properties, body):
     start_time = time.time()
@@ -51,34 +57,50 @@ def callback(ch, method, properties, body):
         local_audio = f"/tmp/{job_id}_audio.wav"
         download_from_minio(s3_client, bucket, s3_key, local_audio)
 
+        # Transcribe with faster-whisper
+        segments, info = model.transcribe(
+            local_audio,
+            language="en",
+            beam_size=5,
+            vad_filter=True  # Voice activity detection helps filter silence
+        )
+
+        # Build transcript in Whisper JSON format
+        transcript_data = {
+            "text": "",
+            "segments": [],
+            "language": info.language
+        }
+        
+        full_text = []
+        for segment in segments:
+            transcript_data["segments"].append({
+                "id": segment.id,
+                "seek": segment.seek,
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text,
+                "tokens": segment.tokens,
+                "temperature": segment.temperature,
+                "avg_logprob": segment.avg_logprob,
+                "compression_ratio": segment.compression_ratio,
+                "no_speech_prob": segment.no_speech_prob
+            })
+            full_text.append(segment.text)
+        
+        transcript_data["text"] = " ".join(full_text).strip()
+        word_count = len(transcript_data["text"].split())
+
+        # Save transcript
         output_dir = f"/tmp/{job_id}_transcript"
         os.makedirs(output_dir, exist_ok=True)
+        transcript_file = os.path.join(output_dir, "transcript.json")
+        
+        with open(transcript_file, 'w') as tf:
+            json.dump(transcript_data, tf, indent=2)
 
-        subprocess.run([
-            "whisper", local_audio,
-            "--model", "base",
-            "--language", "en",
-            "--output_format", "json",
-            "--output_dir", output_dir
-        ], check=True, timeout=1800)
-
-        transcript_file = None
-        for f in os.listdir(output_dir):
-            if f.endswith(".json"):
-                transcript_file = os.path.join(output_dir, f)
-                break
-
-        if transcript_file:
-            transcript_s3_key = f"{job_id}/transcript.json"
-            transcript_uri = upload_to_minio(s3_client, bucket, transcript_s3_key, transcript_file)
-            
-            with open(transcript_file, 'r') as tf:
-                transcript_data = json.load(tf)
-            
-            word_count = len(transcript_data.get("text", "").split())
-        else:
-            transcript_uri = None
-            word_count = 0
+        transcript_s3_key = f"{job_id}/transcript.json"
+        transcript_uri = upload_to_minio(s3_client, bucket, transcript_s3_key, transcript_file)
 
         job["stages"]["transcribe"] = "done"
         job["artifacts"]["transcript"] = transcript_uri
@@ -95,8 +117,9 @@ def callback(ch, method, properties, body):
             "status": "success"
         })
 
+        # Cleanup
         os.remove(local_audio)
-        if transcript_file and os.path.exists(transcript_file):
+        if os.path.exists(transcript_file):
             os.remove(transcript_file)
         if os.path.exists(output_dir):
             os.rmdir(output_dir)

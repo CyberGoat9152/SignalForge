@@ -14,7 +14,7 @@ from shared_utils import (
     get_mongo_client,
     get_minio_client,
     log_execution,
-    download_from_minio
+    download_from_minio_direct
 )
 
 sys.path.append("..")
@@ -65,6 +65,17 @@ def update_job(job_id, job):
 
 def extract_features(local_audio, sr=16000, window_seconds=2):
     logger.info(f"Loading audio: {local_audio}")
+    
+    # Verify file exists before attempting to load
+    if not os.path.exists(local_audio):
+        raise FileNotFoundError(f"Audio file not found: {local_audio}")
+    
+    file_size = os.path.getsize(local_audio)
+    if file_size == 0:
+        raise ValueError(f"Audio file is empty (0 bytes): {local_audio}")
+    
+    logger.info(f"Audio file found: {local_audio} ({file_size} bytes)")
+    
     y, sr = librosa.load(local_audio, sr=sr)
     logger.info(f"Audio loaded: samples={len(y)}, sr={sr}")
 
@@ -122,11 +133,32 @@ def callback(ch, method, properties, body):
         update_job(job_id, job)
 
         s3_key = audio_uri.replace(f"s3://{bucket}/", "")
-        logger.info(f"[{job_id}] Downloading {s3_key}")
-        download_from_minio(s3_client, bucket, s3_key, local_audio)
+        logger.info(f"[{job_id}] Downloading from MinIO - Bucket: {bucket}, Key: {s3_key}")
+        
+        # Download with proper error handling
+        try:
+            download_from_minio_direct(s3_client, bucket, s3_key, local_audio)
+        except Exception as download_error:
+            logger.error(f"[{job_id}] MinIO download failed: {download_error}")
+            raise RuntimeError(f"Failed to download audio from MinIO: {download_error}")
+        
+        # Verify download succeeded
+        if not os.path.exists(local_audio):
+            raise FileNotFoundError(
+                f"Download completed but file not found at {local_audio}. "
+                f"Check MinIO connectivity and permissions."
+            )
+        
+        file_size = os.path.getsize(local_audio)
+        if file_size == 0:
+            raise ValueError(f"Downloaded audio file is empty (0 bytes)")
+        
+        logger.info(f"[{job_id}] Download successful: {file_size} bytes")
 
+        # Extract features
         features, total_samples, sr = extract_features(local_audio)
 
+        # Update job with features
         job.setdefault("features", {})
         job["features"]["audio"] = features
         job["stages"]["audio_features"] = "done"
@@ -144,8 +176,14 @@ def callback(ch, method, properties, body):
 
         logger.info(f"[{job_id}] Completed in {execution_time:.2f}s")
 
-        os.remove(local_audio)
+        # Clean up local file
+        try:
+            os.remove(local_audio)
+            logger.info(f"[{job_id}] Cleaned up temporary file")
+        except Exception as cleanup_error:
+            logger.warning(f"[{job_id}] Failed to clean up {local_audio}: {cleanup_error}")
 
+        # Send to next stage
         ch.basic_publish(
             exchange="",
             routing_key=DONE_QUEUE,
@@ -170,8 +208,16 @@ def callback(ch, method, properties, body):
             job["stages"]["audio_features"] = "failed"
             job["error"] = str(e)
             update_job(job_id, job)
-        except Exception:
-            logger.error("Could not update job state in Redis")
+        except Exception as update_error:
+            logger.error(f"Could not update job state in Redis: {update_error}")
+
+        # Clean up local file if it exists
+        try:
+            if os.path.exists(local_audio):
+                os.remove(local_audio)
+                logger.info(f"[{job_id}] Cleaned up temporary file after error")
+        except Exception as cleanup_error:
+            logger.warning(f"[{job_id}] Failed to clean up {local_audio}: {cleanup_error}")
 
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 

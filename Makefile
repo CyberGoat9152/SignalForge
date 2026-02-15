@@ -1,7 +1,7 @@
 build-base:
 	docker build -f Dockerfile.base -t worker-base:latest . 
 build-download:
-	docker build -f Dockerfile.download -t worker-downlaod:latest . 
+	docker build -f Dockerfile.download -t worker-download:latest . 
 build-audio:
 	docker build -f Dockerfile.audio -t worker-audio:latest . 
 build-transcribe:

@@ -4,7 +4,6 @@ services:
     volumes:
       - ./worker_download:/app
       - ./shared_utils.py:/app/shared_utils.py
-      - /tmp:/tmp
     command: python worker_downlaod.py
     restart: unless-stopped
 
@@ -13,7 +12,6 @@ services:
     volumes:
       - ./worker_split:/app
       - ./shared_utils.py:/app/shared_utils.py
-      - /tmp:/tmp
     command: python worker_split.py
     restart: unless-stopped
 
@@ -22,7 +20,8 @@ services:
     volumes:
       - ./worker_transcribe:/app
       - ./shared_utils.py:/app/shared_utils.py
-      - /tmp:/tmp
+      - ./worker_transcribe/config.yaml:/app/config.yaml
+
     command: python worker_transcribe.py
     restart: unless-stopped
 
@@ -31,12 +30,11 @@ services:
     volumes:
       - ./worker_audio:/app
       - ./shared_utils.py:/app/shared_utils.py
-      - /tmp:/tmp
     command: python worker_audio_features.py
     restart: unless-stopped
 
   worker_metadata:
-    image: worker-base:latest
+    image: worker-download:latest
     volumes:
       - ./worker_metadata:/app
       - ./shared_utils.py:/app/shared_utils.py

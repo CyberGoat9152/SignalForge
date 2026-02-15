@@ -1,18 +1,27 @@
 FROM worker-base:latest
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    git \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -U pip setuptools wheel \
-&& pip install --no-cache-dir openai-whisper \ 
-&& pip install --no-cache-dir -r requirements.txt
 
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir faster-whisper
 
-CMD ["python", "worker.py"]
+RUN python3 -c "import logging; \
+    logging.basicConfig(level=logging.INFO); \
+    logger = logging.getLogger(); \
+    logger.info('Downloading Whisper base model...'); \
+    from faster_whisper import WhisperModel; \
+    model = WhisperModel('base', device='cpu', compute_type='int8'); \
+    logger.info('Model cached successfully!')"
 
+RUN ls -lh /root/.cache/huggingface/ && \
+    echo "Model cache verified!"
+
+COPY worker_transcribe/ .
+
+CMD ["python", "worker_transcribe.py"]

@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Worker audio",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "worker_audio_features.py",
+            "cwd": "${workspaceFolder}/worker_audio/",
+            "console": "integratedTerminal"
+        }
+    ]
+}

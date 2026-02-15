@@ -2,6 +2,7 @@ from pymongo import MongoClient
 from boto3 import client
 from datetime import datetime, timezone
 import json
+import os
 
 def get_mongo_client(config):
     mongo_uri = f"mongodb://{config['MONGO_USER']}:{config['MONGO_PASS']}@{config['MONGO_HOST']}:27017/"
@@ -25,3 +26,15 @@ def upload_to_minio(s3_client, bucket, key, file_path):
 
 def download_from_minio(s3_client, bucket, key, local_path):
     s3_client.download_file(bucket, key, local_path)
+
+def download_from_minio_direct(s3_client, bucket, key, local_path):
+    """Download without atomic rename to avoid permission issues"""
+    
+    os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
+    
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    
+    with open(local_path, 'wb') as f:
+        for chunk in response['Body'].iter_chunks(chunk_size=8192):
+            f.write(chunk)
+    
