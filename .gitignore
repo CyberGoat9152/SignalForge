@@ -1,3 +1,5 @@
 .venv/
 config.yaml
 __pycache__/
+*.zip
+*/shared_utils.py

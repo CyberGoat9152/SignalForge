@@ -1,27 +1,30 @@
 import pika
 import json
-import redis
 import subprocess
 import os
 import yaml
 import time
 from datetime import datetime, timezone
+import logging
 import sys
+from shared_utils import (
+    get_mongo_client, get_minio_client, log_execution, upload_to_minio,
+    get_job, update_job_stage, update_job_artifacts, set_job_error
+)
+
 sys.path.append('..')
-from shared_utils import get_mongo_client, get_minio_client, log_execution, upload_to_minio
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("download_worker")
 
 config = yaml.safe_load(open("./config.yaml", "r").read())
 RABBIT_URL = config["RABBIT_URL"]
 LISTEN_QUEUE = config["LISTEN_QUEUE"]
 DONE_QUEUE = config["DONE_QUEUE"]
-REDIS_HOST = config["REDIS_HOST"]
-REDIS_PORT = config["REDIS_PORT"]
-
-r = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    decode_responses=True
-)
 
 mongo_client = get_mongo_client(config)
 mongo_db = mongo_client[config["MONGO_DB"]]
@@ -38,14 +41,13 @@ def callback(ch, method, properties, body):
 
     job_id = msg["job_id"]
     url = msg["url"]
-    key = f"job:{job_id}"
     
     try:
-        job = json.loads(r.get(key))
+        job = get_job(mongo_db, job_id)
+        if not job:
+            raise Exception(f"[Worker-Download] Job {job_id} not found in MongoDB")
         
-        job["stages"]["download"] = "running"
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        update_job_stage(mongo_db, job_id, "download", "running")
 
         local_path = f"/tmp/{job_id}_raw.mp4"
         
@@ -58,10 +60,8 @@ def callback(ch, method, properties, body):
         s3_key = f"{job_id}/raw.mp4"
         s3_uri = upload_to_minio(s3_client, bucket, s3_key, local_path)
 
-        job["stages"]["download"] = "done"
-        job["artifacts"]["raw_video"] = s3_uri
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        update_job_stage(mongo_db, job_id, "download", "done")
+        update_job_artifacts(mongo_db, job_id, "raw_video", s3_uri)
 
         execution_time = time.time() - start_time
         
@@ -83,8 +83,12 @@ def callback(ch, method, properties, body):
         ch.basic_publish(exchange="", routing_key=DONE_QUEUE, body=json.dumps(next_msg))
         ch.basic_ack(delivery_tag=method.delivery_tag)
         
+        logger.info(f"[Worker-Download][{job_id}] <ok> Download completed for job ")
+        
     except Exception as e:
         execution_time = time.time() - start_time
+        
+        logger.error(f"[Worker-Download][{job_id}] <Failed> Download failed for job see mongodb for logging")
         
         log_execution(mongo_db, "downloads", {
             "job_id": job_id,
@@ -94,20 +98,16 @@ def callback(ch, method, properties, body):
             "status": "failed"
         })
         
-        job = json.loads(r.get(key))
-        job["stages"]["download"] = "failed"
-        job["status"] = "failed"
-        job["error"] = str(e)
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        set_job_error(mongo_db, job_id, "download", str(e))
         
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-print("Download worker starting...")
+logger.info("[Worker-Download] Download worker starting...")
 conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
 ch = conn.channel()
 ch.queue_declare(queue=LISTEN_QUEUE, durable=True)
 ch.basic_qos(prefetch_count=1)
 ch.basic_consume(queue=LISTEN_QUEUE, on_message_callback=callback)
-print(f"Listening on {LISTEN_QUEUE}")
+logger.info("[Worker-Download] Download worker starting...OK")
+logger.info("[Worker-Download] Listening on {LISTEN_QUEUE}")
 ch.start_consuming()

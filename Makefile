@@ -6,5 +6,7 @@ build-audio:
 	docker build -f Dockerfile.audio -t worker-audio:latest . 
 build-transcribe:
 	docker build -f Dockerfile.transcribe -t worker-transcribe:latest . 
-build: build-base build-download build-audio build-transcribe
-	echo "done"
+build-streamlit:
+	docker build -f Dockerfile.streamlit -t worker-streamlit:latest . 
+build: build-base build-download build-audio build-streamlit build-transcribe
+	@echo "done"

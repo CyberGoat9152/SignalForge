@@ -1,103 +1,58 @@
 import pika
 import json
 import yaml
-import redis
 import subprocess
 import time
 from datetime import datetime, timezone
 import sys
 import logging
-
-# Configure logging FIRST
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+from shared_utils import (
+    get_mongo_client, log_execution,
+    get_job, update_job_stage, update_job_metadata, set_job_error
 )
-logger = logging.getLogger(__name__)
-
-logger.info("=" * 60)
-logger.info("METADATA PUBLIC WORKER INITIALIZING")
-logger.info("=" * 60)
 
 sys.path.append('..')
-from shared_utils import get_mongo_client, log_execution
 
-# Load config
-logger.info("Loading configuration...")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("puclic_metadata_extractor_worker")
+
 config = yaml.safe_load(open("./config.yaml", "r").read())
 RABBIT_URL = config["RABBIT_URL"]
 LISTEN_QUEUE = config["LISTEN_QUEUE"]
 DONE_QUEUE = config["DONE_QUEUE"]
-REDIS_HOST = config["REDIS_HOST"]
-REDIS_PORT = config["REDIS_PORT"]
-logger.info(f"  Listen Queue: {LISTEN_QUEUE}")
-logger.info(f"  Done Queue: {DONE_QUEUE}")
 
-# Connect to Redis
-logger.info("Connecting to Redis...")
-r = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    decode_responses=True
-)
-try:
-    r.ping()
-    logger.info("  ✓ Redis connection successful")
-except Exception as e:
-    logger.error(f"  ✗ Redis connection failed: {e}")
-    raise
-
-# Connect to MongoDB
-logger.info("Connecting to MongoDB...")
-try:
-    mongo_client = get_mongo_client(config)
-    mongo_db = mongo_client[config["MONGO_DB"]]
-    logger.info("  ✓ MongoDB connection successful")
-except Exception as e:
-    logger.error(f"  ✗ MongoDB connection failed: {e}")
-    raise
-
-# Verify yt-dlp is available
-logger.info("Checking for yt-dlp...")
-try:
-    result = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=5)
-    if result.returncode == 0:
-        version = result.stdout.strip()
-        logger.info(f"  ✓ yt-dlp available: {version}")
-    else:
-        logger.warning("  ⚠ yt-dlp found but version check failed")
-except FileNotFoundError:
-    logger.error("  ✗ yt-dlp not found! Install with: pip install yt-dlp")
-    raise
-except Exception as e:
-    logger.warning(f"  ⚠ Could not verify yt-dlp: {e}")
+mongo_client = get_mongo_client(config)
+mongo_db = mongo_client[config["MONGO_DB"]]
 
 def callback(ch, method, properties, body):
     start_time = time.time()
     msg = json.loads(body)
     
     if msg.get("stage") != "metadata_public":
-        logger.warning(f"Received message for wrong stage: {msg.get('stage')}, requeuing")
+        logger.warning(f"[Worker-Public-Metadata-Extractor] Received message for wrong stage: {msg.get('stage')}, requeuing")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         return
 
     job_id = msg["job_id"]
     logger.info(f"[{job_id}] Processing metadata job")
-    key = f"job:{job_id}"
     
     try:
-        job = json.loads(r.get(key))
+        job = get_job(mongo_db, job_id)
+        if not job:
+            raise Exception(f"Job {job_id} not found in MongoDB")
         
-        job["stages"]["metadata_public"] = "running"
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
-        logger.info(f"[{job_id}] Job status updated to 'running'")
+        update_job_stage(mongo_db, job_id, "metadata_public", "running")
+        logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] Job status updated to 'running'")
 
         metadata = {}
         url = job.get("url")
         
         if url and ("youtube.com" in url or "youtu.be" in url):
-            logger.info(f"[{job_id}] Fetching YouTube metadata for: {url}")
+            logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] Fetching YouTube metadata for: {url}")
             
             try:
                 result = subprocess.run([
@@ -120,11 +75,10 @@ def callback(ch, method, properties, body):
                         "tags": video_info.get("tags", [])[:10]
                     }
                     
-                    logger.info(f"[{job_id}] Video: {metadata.get('title', 'Unknown')}")
-                    logger.info(f"[{job_id}] Views: {metadata.get('view_count', 0):,}")
-                    logger.info(f"[{job_id}] Likes: {metadata.get('like_count', 0):,}")
+                    logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] Video: {metadata.get('title', 'Unknown')}")
+                    logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] Views: {metadata.get('view_count', 0):,}")
+                    logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] Likes: {metadata.get('like_count', 0):,}")
                     
-                    # Calculate derived metrics
                     if metadata["view_count"] and metadata["duration"]:
                         upload_date = metadata.get("upload_date")
                         if upload_date:
@@ -135,14 +89,12 @@ def callback(ch, method, properties, body):
                                     metadata["views_per_day"] = metadata["view_count"] / days_since
                                 else:
                                     metadata["views_per_day"] = metadata["view_count"]
-                                logger.info(f"[{job_id}] Views/day: {metadata['views_per_day']:.1f}")
                             except Exception as e:
-                                logger.warning(f"[{job_id}] Could not calculate views_per_day: {e}")
+                                logger.warning(f"[Worker-Public-Metadata-Extractor] [{job_id}] Could not calculate views_per_day: {e}")
                                 metadata["views_per_day"] = 0
                     
                     if metadata["view_count"] > 0 and metadata["like_count"]:
                         metadata["like_ratio"] = metadata["like_count"] / metadata["view_count"]
-                        logger.info(f"[{job_id}] Like ratio: {metadata['like_ratio']:.4f}")
                     else:
                         metadata["like_ratio"] = 0
                     
@@ -150,26 +102,22 @@ def callback(ch, method, properties, body):
                     if metadata["view_count"] > 0:
                         engagement = (metadata["like_count"] + metadata["comment_count"] * 2) / metadata["view_count"]
                     metadata["engagement_score"] = engagement
-                    logger.info(f"[{job_id}] Engagement score: {engagement:.6f}")
+                    logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] <OK> Engagement score: {engagement:.6f}")
                     
                 else:
-                    logger.error(f"[{job_id}] yt-dlp failed: {result.stderr}")
+                    logger.error(f"[Worker-Public-Metadata-Extractor] [{job_id}] <Failed> yt-dlp failed: {result.stderr}")
                     
             except subprocess.TimeoutExpired:
-                logger.error(f"[{job_id}] yt-dlp timed out after 30s")
+                logger.error(f"[Worker-Public-Metadata-Extractor] [{job_id}] <Failed> yt-dlp timed out after 30s")
             except json.JSONDecodeError as e:
-                logger.error(f"[{job_id}] Failed to parse yt-dlp output: {e}")
+                logger.error(f"[Worker-Public-Metadata-Extractor] [{job_id}] <Failed> parse yt-dlp output: {e}")
             except Exception as e:
-                logger.error(f"[{job_id}] Error fetching metadata: {e}")
+                logger.error(f"[Worker-Public-Metadata-Extractor] [{job_id}] <Failed> Error fetching metadata: {e}")
         else:
-            logger.info(f"[{job_id}] URL is not a YouTube link, skipping metadata")
-        
-        if "metadata" not in job:
-            job["metadata"] = {}
-        job["metadata"]["public"] = metadata
-        job["stages"]["metadata_public"] = "done"
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+            logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] <OK> URL is not a YouTube link, skipping metadata")
+
+        update_job_metadata(mongo_db, job_id, "public", metadata)
+        update_job_stage(mongo_db, job_id, "metadata_public", "done")
 
         execution_time = time.time() - start_time
         
@@ -182,19 +130,16 @@ def callback(ch, method, properties, body):
             "status": "success"
         })
 
-        next_msg = {
-            "job_id": job_id,
-            "stage": "scoring"
-        }
-        logger.info(f"[{job_id}] Publishing to queue: {DONE_QUEUE}")
+        next_msg = {"job_id": job_id, "stage": "scoring"}
+        logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] Publishing to queue: {DONE_QUEUE}")
         ch.basic_publish(exchange="", routing_key=DONE_QUEUE, body=json.dumps(next_msg))
         ch.basic_ack(delivery_tag=method.delivery_tag)
         
-        logger.info(f"[{job_id}] ✓ Job completed successfully in {execution_time:.2f}s")
+        logger.info(f"[Worker-Public-Metadata-Extractor] [{job_id}] <OK> Job completed successfully in {execution_time:.2f}s")
         
     except Exception as e:
         execution_time = time.time() - start_time
-        logger.error(f"[{job_id}] ✗ Job failed: {e}", exc_info=True)
+        logger.error(f"[Worker-Public-Metadata-Extractor] [{job_id}] <Failed> Job failed see mongodb for logging ", exc_info=True)
         
         log_execution(mongo_db, "metadata_public", {
             "job_id": job_id,
@@ -203,39 +148,21 @@ def callback(ch, method, properties, body):
             "status": "failed"
         })
         
-        # Don't fail the entire pipeline - just use empty metadata
-        job = json.loads(r.get(key))
-        job["stages"]["metadata_public"] = "done"
-        job["metadata"] = {"public": {}}
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        update_job_metadata(mongo_db, job_id, "public", {})
+        update_job_stage(mongo_db, job_id, "metadata_public", "done")
         
-        next_msg = {
-            "job_id": job_id,
-            "stage": "scoring"
-        }
+        next_msg = {"job_id": job_id, "stage": "scoring"}
         logger.info(f"[{job_id}] Continuing pipeline despite error...")
         ch.basic_publish(exchange="", routing_key=DONE_QUEUE, body=json.dumps(next_msg))
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
-# Connect to RabbitMQ
-logger.info("Connecting to RabbitMQ...")
-try:
-    conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
-    ch = conn.channel()
-    ch.queue_declare(queue=LISTEN_QUEUE, durable=True)
-    ch.queue_declare(queue=DONE_QUEUE, durable=True)
-    ch.basic_qos(prefetch_count=1)
-    ch.basic_consume(queue=LISTEN_QUEUE, on_message_callback=callback)
-    logger.info("  ✓ RabbitMQ connection successful")
-except Exception as e:
-    logger.error(f"  ✗ RabbitMQ connection failed: {e}")
-    raise
-
-logger.info("")
-logger.info("=" * 60)
-logger.info(f"✓ METADATA PUBLIC WORKER READY - Listening on {LISTEN_QUEUE}")
-logger.info("=" * 60)
-logger.info("")
-
+logger.info("[Worker-Public-Metadata-Extractor] Metadata worker starting...")
+conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
+ch = conn.channel()
+ch.queue_declare(queue=LISTEN_QUEUE, durable=True)
+ch.queue_declare(queue=DONE_QUEUE, durable=True)
+ch.basic_qos(prefetch_count=1)
+ch.basic_consume(queue=LISTEN_QUEUE, on_message_callback=callback)
+logger.info("[Worker-Public-Metadata-Extractor] Metadata worker starting...OK")
+logger.info(f"[Worker-Public-Metadata-Extractor] Listening on {LISTEN_QUEUE}")
 ch.start_consuming()

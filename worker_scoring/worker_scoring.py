@@ -1,30 +1,31 @@
 import pika
 import json
 import yaml
-import redis
 import time
 import numpy as np
 from datetime import datetime, timezone
 import sys
+import logging
+from shared_utils import (
+    get_mongo_client, log_execution,
+    get_job, update_job_stage, update_job_scores, update_job_status, set_job_error
+)
+
 sys.path.append('..')
-from shared_utils import get_mongo_client, get_minio_client, log_execution, download_from_minio
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("scoring_worker")
 
 config = yaml.safe_load(open("./config.yaml", "r").read())
 RABBIT_URL = config["RABBIT_URL"]
 LISTEN_QUEUE = config["LISTEN_QUEUE"]
-REDIS_HOST = config["REDIS_HOST"]
-REDIS_PORT = config["REDIS_PORT"]
-
-r = redis.Redis(
-    host=REDIS_HOST,
-    port=REDIS_PORT,
-    decode_responses=True
-)
 
 mongo_client = get_mongo_client(config)
 mongo_db = mongo_client[config["MONGO_DB"]]
-s3_client = get_minio_client(config)
-bucket = config["MINIO_BUCKET"]
 
 def normalize(values):
     if not values or len(values) == 0:
@@ -39,7 +40,6 @@ def normalize(values):
 def score_segments(job):
     audio_features = job.get("features", {}).get("audio", [])
     metadata = job.get("metadata", {}).get("public", {})
-    transcript_uri = job.get("artifacts", {}).get("transcript")
     
     if not audio_features:
         return []
@@ -77,6 +77,7 @@ def score_segments(job):
             "pitch": feature["pitch"]
         })
     
+    # Smooth scores with moving window
     window_size = 3
     smoothed_segments = []
     for i in range(len(segments)):
@@ -102,24 +103,22 @@ def callback(ch, method, properties, body):
         return
 
     job_id = msg["job_id"]
-    key = f"job:{job_id}"
     
     try:
-        job = json.loads(r.get(key))
+        job = get_job(mongo_db, job_id)
+        if not job:
+            raise Exception(f"Job {job_id} not found in MongoDB")
         
-        job["stages"]["scoring"] = "running"
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        update_job_stage(mongo_db, job_id, "scoring", "running")
 
         ranked_segments = score_segments(job)
 
-        if "scores" not in job:
-            job["scores"] = {}
-        job["scores"]["segments"] = ranked_segments[:50]
-        job["stages"]["scoring"] = "done"
-        job["status"] = "completed"
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        scores_data = {
+            "segments": ranked_segments[:50]
+        }
+        update_job_scores(mongo_db, job_id, scores_data)
+        update_job_stage(mongo_db, job_id, "scoring", "done")
+        update_job_status(mongo_db, job_id, "completed")
 
         execution_time = time.time() - start_time
         
@@ -137,8 +136,12 @@ def callback(ch, method, properties, body):
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
         
+        logger.inf(f"[Worker-Scoring] [{job_id}] <OK> Scoring completed for job ")
+        
     except Exception as e:
         execution_time = time.time() - start_time
+        
+        logger.error(f"[Worker-Scoring] [{job_id}] <Failed> Scoring failed for job see mongodb for logging")
         
         log_execution(mongo_db, "scoring", {
             "job_id": job_id,
@@ -147,20 +150,16 @@ def callback(ch, method, properties, body):
             "status": "failed"
         })
         
-        job = json.loads(r.get(key))
-        job["stages"]["scoring"] = "failed"
-        job["status"] = "failed"
-        job["error"] = str(e)
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        r.set(key, json.dumps(job))
+        set_job_error(mongo_db, job_id, "scoring", str(e))
         
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-print("Scoring worker starting...")
+print("[Worker-Scoring] Scoring worker starting...")
 conn = pika.BlockingConnection(pika.URLParameters(RABBIT_URL))
 ch = conn.channel()
 ch.queue_declare(queue=LISTEN_QUEUE, durable=True)
 ch.basic_qos(prefetch_count=1)
 ch.basic_consume(queue=LISTEN_QUEUE, on_message_callback=callback)
-print(f"Listening on {LISTEN_QUEUE}")
+print("[Worker-Scoring] Scoring worker starting...OK")
+print(f"[Worker-Scoring] Listening on {LISTEN_QUEUE}")
 ch.start_consuming()
